@@ -1,0 +1,249 @@
+---
+title: "A1_JosephDuraisingh"
+author: "Joseph Duraisingh"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+date: "2026-02-08"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+## Introduction
+
+The dataset that I am looking at is a bulk RNA-sequencing dataset which looks at glucocorticoid stress hormones on human fibroblast cells. This data was collected to study the effects of chronic stress on RNA transcription. This dataset has four conditions: A vehicle control condition, a cortisol treated condition, a control treated with a glucocorticoid antagonist paired with the cortisol treatment. These four treatments aim to ask what the effects of stress are and whether they are tied to the functionality of the glucocorticoid receptor. For my analysis I will be conducting differential expression between the cortisol treatment and the vehicle control to identify genes that are affected by stress. There are 6 replicates for each condition. I am interested in this dataset because stress is a prevalent condition in our modern world. It provides a clear connection between our mental experience and our biological selves. As university students we undergo a lot of chronic stress, so understanding the biological effects caused by this is a very worthwhile analysis.
+
+## Analysis
+
+### Data Acquisition
+
+Download dataset if necessary from the geo accessor plus loading it into an environment variable:
+
+```{r message=FALSE, warning=FALSE}
+library(GEOquery)
+if (!file.exists("GSE210302")) {
+  # weird downloading method because I was having trouble getting the zipped files loaded in
+  dir.create("GSE210302", showWarnings = FALSE)
+  getGEOSuppFiles("GSE210302", makeDirectory = FALSE, baseDir = "GSE210302")
+  list.files("GSE210302", recursive = TRUE)
+  gz <- list.files("GSE210302", pattern = "normCounts\\.csv\\.gz$", full.names = TRUE)
+  if (length(gz) == 1) {
+    R.utils::gunzip(gz, remove = FALSE, overwrite = TRUE)
+  }
+  csv <- list.files("GSE210302", pattern = "normCounts\\.csv$", full.names = TRUE)
+  expression <- read.csv(csv[1], check.names = FALSE)
+  } else{
+  expression <- read.csv("GSE210302/GSE210302_RNA_seq_normCounts.csv", sep = ",")
+}
+```
+
+### Load in dataset
+
+```{r message=FALSE, warning=FALSE}
+
+rownames(expression) <- expression[,1]
+expression <- expression[, -1]
+
+ensembl_ids <- gsub("\\..*", "", rownames(expression))
+```
+
+### Mapping to HUGO symbols
+
+Since the original dataset had the genes labeled in their ensemble format, BioMart was used to convert them to their gene names with some additional cleaning needed performing for ensembl ids that didn't map to a gene or multiple ones that mapped to the same gene.
+
+```{r message=FALSE, warning=FALSE}
+library(biomaRt)
+mart <- useEnsembl(biomart="genes", dataset="hsapiens_gene_ensembl")
+
+# access the annotations from the biomart database
+annotations <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+
+# extract the gene names
+symbol_map <- setNames(annotations$hgnc_symbol, annotations$ensembl_gene_id)
+gene_symbol <- symbol_map[ensembl_ids]
+
+# for dealing with gene overlaps
+keep <- !is.na(gene_symbol) & gene_symbol != ""
+expression <- expression[keep, ]
+gene_symbol <- gene_symbol[keep]
+expression_gene <- rowsum(as.matrix(expression), group = gene_symbol)
+```
+
+### Data Preparation
+
+In this section the counts table is prepared for use in Limma. Here the selected conditions are extracted from the larger table (vehicle and cortisol). Then the normalized counts are logged, and genes that are very lowly expressed are removed.
+
+```{r message=FALSE, warning=FALSE}
+library(limma)
+
+# Isolate the columns for the data I'll be using
+data_exper <- expression_gene[, 7:18]
+
+E <- data_exper
+mode(E) <- "numeric"
+
+Elog <- log2(E + 1)
+
+keep <- rowSums(Elog > 0.5) >= 3
+Elog <- Elog[keep, ]
+
+```
+
+### Outlier removal
+
+To check for outlier data I run plotMDS to see the expression patterns of each replicate. Here we see that Vehicle 4 is an outlier and is not clustering with the other replicates in the condition. This creates noise signal for the control data, so we will remove it in the next block of code.
+
+```{r message=FALSE, warning=FALSE}
+# check for outliers
+group <- factor(c(rep("cortisol", 6), rep("control", 6)), levels=c("control","cortisol"))
+mds <- plotMDS(
+  Elog,
+  pch = 16,
+  col = c("blue", "firebrick")[group],
+  main = "MDS Plot of Normalized Expression Data",
+  xlab = "Dimension 1 (Leading logFC)",
+  ylab = "Dimension 2 (Leading logFC)"
+)
+legend(
+  "topright",
+  legend = levels(group),
+  col = c("blue", "firebrick"),
+  pch = 16,
+  bty = "n"
+)
+```
+
+Figure 1. MDS plot of normalized expression data trends for log-standardized between samples. Baseline expectation is that different conditions will cluster together. An additional parameter was included to identify which dot corresponds to which cluster, with the top right being vehicle 4. This shows it has different expression pattern to the other control samples.
+
+### Differential Expression
+
+Since the data I am using is already normalized, I will use Limma to perform the differential expression. To do this we take the log-normalized counts and apply the ebayes method for differential expression calculations.
+
+```{r message=FALSE, warning=FALSE}
+if (ncol(Elog) == 12){
+  Elog <- Elog[,-10]
+}
+
+group <- factor(c(rep("cortisol", 6), rep("control", 5)), levels=c("control","cortisol"))
+design <- model.matrix(~ group)
+
+fit <- eBayes(lmFit(Elog, design))
+hits <- topTable(fit, coef="groupcortisol", number=Inf, adjust.method="BH")
+
+head(hits)
+```
+
+Table 1. This output table shows all the filtered genes sorted by adjusted p-value for their level of differential expression across conditions.
+
+### Volcano Plot
+
+Standard volcano plot code for limma hits output. We use adjusted p-value metric over normal p-value to account for multiple hypothesis testing of having multiple samples and genes being tested.
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+hits$gene <- rownames(hits)
+hits$negLogAdjP <- -log10(hits$adj.P.Val)
+
+logfc_cutoff <- 1
+fdr_cutoff <- 0.05
+
+hits$significance <- "NS"
+hits$significance[hits$adj.P.Val < fdr_cutoff & hits$logFC > logfc_cutoff]  <- "Up"
+hits$significance[hits$adj.P.Val < fdr_cutoff & hits$logFC < -logfc_cutoff] <- "Down"
+
+ggplot(hits, aes(x = logFC, y = negLogAdjP, color = significance)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  scale_color_manual(values = c(
+    "Up" = "firebrick",
+    "Down" = "steelblue",
+    "NS" = "grey70"
+  )) +
+  geom_vline(xintercept = c(-logfc_cutoff, logfc_cutoff), linetype = "dashed") +
+  geom_hline(yintercept = -log10(fdr_cutoff), linetype = "dashed") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Volcano Plot of Differential Expression: Cortisol vs Vehicle",
+    x = "log2 Fold Change",
+    y = "-log10 Adjusted P-value"
+  )
+```
+
+Figure 4. The volcano plot shows the distribution of genes in the differential expression analysis. Each gene is plotted based on adjusted P-Value and its log fold change. Genes that pass the threshold of 0.05 for p-value and 1 for log fold change are included in the plot. Genes of interest include ZBTB16 in the top right corner, as well as other ones atop the adjusted p-value table such as B3GNT5 and PLXNC1 showing strong correlation to cortisol pathways while expression of CLDN1 and SPOCK1 lean the other way.
+
+### Data Inspection
+
+Here we investigate how many positive and negative hits we got. We first look at the number of significantly differentially expressed genes, then count the number of ones that are expressed more in the positive and negative conditions.
+
+```{r message=FALSE, warning=FALSE}
+sig_hits <- hits[hits$adj.P.Val < 0.05, ]
+num_sig <- nrow(sig_hits)
+print(paste("Hits:", num_sig))
+
+pos_hits <- sig_hits[sig_hits$logFC > 1, ]
+neg_hits <- sig_hits[sig_hits$logFC < -1, ]
+print(paste("Cortisol enhanced hits: ", nrow(pos_hits)))
+print(paste("Cortisol reduced hits: ", nrow(neg_hits)))
+```
+
+### Heatmap
+
+To visualize the distribution of how the genes differentiate across the samples, I created a heatmap using standard complexheatmap workflow. This shows how conserved the expression patterns are across samples of the same condition.
+
+```{r message=FALSE, warning=FALSE}
+library(ComplexHeatmap)
+library(circlize)
+
+heatmap_matrix <- Elog
+
+top_hits <- rownames(hits)[hits$adj.P.Val < 0.05]
+
+hm_sig <- heatmap_matrix[
+  rownames(heatmap_matrix) %in% top_hits,
+  , drop = FALSE
+]
+
+hm_sig <- t(scale(t(hm_sig)))
+hm_sig[is.na(hm_sig)] <- 0
+
+heatmap_col <- colorRamp2(
+  c(-2, 0, 2),
+  c("blue", "white", "red")
+)
+ht_sig <- Heatmap(
+  as.matrix(hm_sig),
+  name = "Z-score",
+  column_title = "Significant Genes (adj.P.Val < 0.05)",
+  show_row_names = FALSE,
+  show_column_names = TRUE,
+  col = heatmap_col
+)
+print(ht_sig)
+```
+
+Figure 3. Heatmap to show general expression pattern of genes. At an adjusted significance level of 0.05 this shows significant differential expression genes and which conditions they cluster for. The coloration scheme shows there is a clear evidence of significant genes clustering by treatment vs control.
+
+## Discussion
+
+The results show 4871 significantly differentially expressed genes, with 660 being largely positively expressed under induced cortisol stress and 552 being largely negatively expressed under these conditions. A gene of particular interest due to how strong the differential expression signal is the ZBTB16 gene. This gene is a direct downstream transcript of the glucocorticoid receptor, so it makes sense that the signal is strong. By seeing what other genes are also being activated, we can start to develop models for stress response. These pathways can give us further insights on the way in which chronic stress affects the body.
+
+## References
+
+Durinck S, Spellman P, Birney E, Huber W (2009). “Mapping identifiers for the integration of genomic datasets with the R/Bioconductor package biomaRt.” *Nature Protocols*, **4**, 1184–1191.
+
+Gu, Z. (2022) Complex Heatmap Visualization, iMeta. DOI: [10.1002/imt2.43](https://doi.org/10.1002/imt2.43).
+
+Gu Z, Gu L, Eils R, Schlesner M, Brors B (2014). “circlize implements and enhances circular visualization in R.” *Bioinformatics*. [doi:10.1093/bioinformatics/btu393](https://doi.org/10.1093/bioinformatics/btu393), <https://doi.org/10.1093/bioinformatics/btu393>.
+
+Leung CS, Kosyk O, Welter EM, Dietrich N et al. Chronic stress-driven glucocorticoid receptor activation programs key cell phenotypes and functional epigenomic patterns in human fibroblasts. iScience 2022 Sep 16;25(9):104960
+
+Ritchie ME, Phipson B, Wu D, Hu Y, Law CW, Shi W, Smyth GK (2015). “limma powers differential expression analyses for RNA-sequencing and microarray studies.” *Nucleic Acids Research*, **43**(7), e47. [doi:10.1093/nar/gkv007](https://doi.org/10.1093/nar/gkv007).
